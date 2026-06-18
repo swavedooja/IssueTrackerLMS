@@ -1,0 +1,1130 @@
+# ITMS Ticketing System — Full Solution Document
+
+**Product:** Integrated Transport Management System (ITMS)  
+**Module:** Ticketing & Issue Resolution System  
+**Tech Stack:** React (Web) · React Native (Mobile) · Express.js · Supabase (PostgreSQL)  
+**Version:** 1.0  
+**Date:** June 2025
+
+---
+
+## Table of Contents
+
+1. [Overview & Goals](#1-overview--goals)
+2. [System Architecture](#2-system-architecture)
+3. [Database Schema](#3-database-schema)
+4. [Master Data & Configuration](#4-master-data--configuration)
+5. [Ticket Lifecycle & Resolution Flow](#5-ticket-lifecycle--resolution-flow)
+6. [Shift Management & Roster Engine](#6-shift-management--roster-engine)
+7. [Escalation Engine](#7-escalation-engine)
+8. [Intake Channels](#8-intake-channels)
+9. [Chatbot Flow](#9-chatbot-flow)
+10. [RCA Module](#10-rca-module)
+11. [API Design](#11-api-design)
+12. [Frontend — Web Portal](#12-frontend--web-portal)
+13. [Frontend — Mobile App](#13-frontend--mobile-app)
+14. [Notifications & Alerts](#14-notifications--alerts)
+15. [Roles & Permissions](#15-roles--permissions)
+16. [Reporting & Analytics](#16-reporting--analytics)
+17. [Integration Points (ITMS Core)](#17-integration-points-itms-core)
+18. [Implementation Roadmap](#18-implementation-roadmap)
+19. [Environment & DevOps](#19-environment--devops)
+
+---
+
+## 1. Overview & Goals
+
+### 1.1 Purpose
+
+The ITMS Ticketing System is a bundled support module that allows all ITMS stakeholders — transporters, logistics teams, plant operators, and administrators — to raise, track, and resolve issues across hardware, software, network, and operational domains. It is designed to be embedded within the ITMS web portal and mobile app, with additional intake via email, WhatsApp, Telegram, and a conversational chatbot.
+
+### 1.2 Key Principles
+
+- **Zero friction intake:** Any user, regardless of technical literacy, should be able to raise a ticket in under two minutes.
+- **Highly configurable resolution flow:** Category → subcategory → assignment group → shift roster → escalation levels — all driven by master data, not hard-coded logic.
+- **Shift-aware routing:** The system always knows who is on shift right now and routes the ticket to the correct person's worklist.
+- **Dual RCA:** A customer-facing RCA (plain language) and a technical/internal RCA (detailed) for every resolved ticket.
+- **Full auditability:** Every state change, assignment, and comment is time-stamped and attributed.
+
+### 1.3 User Personas
+
+| Persona | Description |
+|---|---|
+| Transporter | Raises tickets for registration issues, trip problems, vehicle/driver rejections |
+| Logistics Coordinator | Raises or monitors tickets for operational disruptions |
+| Plant Operator | Raises hardware/network issues (RFID, boom barrier, weighbridge) |
+| L1 Support Agent | First responder on shift; triages and resolves or escalates |
+| L2 / Domain Expert | Receives escalations; resolves complex issues (software engineer, network engineer, data team) |
+| L3 / Senior Expert | Final escalation level; handles critical or unresolved issues |
+| Admin / Supervisor | Manages master data, rosters, SLA configs, reports |
+
+---
+
+## 2. System Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────┐
+│                          INTAKE CHANNELS                             │
+│  Web Portal │ Mobile App │ Email │ WhatsApp Bot │ Telegram Bot       │
+│  └──────────────────────┬───────────────────────────────────────────────┘
+                       │ REST / Webhook
+┌──────────────────────▼───────────────────────────────────────────────┐
+│                    API GATEWAY (Express.js)                          │
+│  Auth Middleware │ Rate Limiting │ Webhook Receivers │ REST Routes   │
+└──────────────────────┬───────────────────────────────────────────────┘
+                       │
+        ┌──────────────┼──────────────────┐
+        │              │                  │
+┌───────▼──────┐ ┌─────▼──────┐ ┌────────▼────────┐
+│  Ticket      │ │  Shift /   │ │  Notification   │
+│  Service     │ │  Roster    │ │  Service        │
+│              │ │  Engine    │ │  (Email/Push/   │
+│  - Create    │ │            │ │   WhatsApp/TG)  │
+│  - Update    │ │  - On-duty │ └─────────────────┘
+│  - Assign    │ │    lookup  │
+│  - Escalate  │ │  - Shift   │
+│  - SLA check │ │    clock   │
+└───────┬──────┘ └────────────┘
+        │
+┌───────▼──────────────────────────────────────────┐
+│                  SUPABASE (PostgreSQL)            │
+│  Tickets │ Comments │ Roster │ Master Data │ RCA  │
+│  Row-Level Security enabled per tenant/org       │
+└──────────────────────────────────────────────────┘
+        │
+┌───────▼────────────────────────┐
+│  ITMS Core (Existing System)   │
+│  Angular + Spring Boot         │
+│  REST API integration          │
+└────────────────────────────────┘
+```
+
+### 2.1 Technology Choices
+
+| Layer | Technology | Reason |
+|---|---|---|
+| Web Frontend | React + TypeScript | Component reuse, strong ecosystem |
+| Mobile App | React Native | Code sharing with web, cross-platform |
+| Backend API | Express.js (Node.js) | Lightweight, fast iteration |
+| Database | Supabase (PostgreSQL) | Realtime subscriptions, built-in auth, row-level security |
+| File Storage | Supabase Storage | Attachments, RCA documents |
+| Email Intake | Nodemailer / Mailgun webhook | Inbound email parsing |
+| WhatsApp Bot | Twilio WhatsApp API | Business-verified messaging |
+| Telegram Bot | Telegram Bot API (node-telegram-bot-api) | Chatbot intake |
+| Push Notifications | Firebase Cloud Messaging (FCM) | Mobile push |
+| Job Scheduler | node-cron | SLA checks, escalation triggers |
+
+---
+
+## 3. Database Schema
+
+All tables live in Supabase. Multi-tenancy is implemented via an `org_id` column with Supabase Row-Level Security (RLS) policies.
+
+### 3.1 Core Ticket Table
+
+```sql
+CREATE TABLE tickets (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ticket_number   TEXT UNIQUE NOT NULL,          -- e.g. TKT-2025-00001
+  org_id          UUID NOT NULL REFERENCES orgs(id),
+  title           TEXT NOT NULL,
+  description     TEXT,
+  status          TEXT NOT NULL DEFAULT 'open',  -- open | in_progress | pending | resolved | closed
+  priority        TEXT NOT NULL DEFAULT 'medium',-- critical | high | medium | low
+  category_id     UUID REFERENCES ticket_categories(id),
+  subcategory_id  UUID REFERENCES ticket_subcategories(id),
+  location_type   TEXT,                          -- 'plant' | 'site' | 'remote'
+  location_id     UUID REFERENCES locations(id),
+  source          TEXT,                          -- 'web' | 'mobile' | 'email' | 'whatsapp' | 'telegram' | 'chatbot'
+  raised_by       UUID REFERENCES users(id),
+  assigned_to     UUID REFERENCES users(id),
+  assigned_group  UUID REFERENCES assignment_groups(id),
+  shift_id        UUID REFERENCES shifts(id),    -- shift active when ticket was raised
+  sla_due_at      TIMESTAMPTZ,
+  sla_breached    BOOLEAN DEFAULT FALSE,
+  resolved_at     TIMESTAMPTZ,
+  closed_at       TIMESTAMPTZ,
+  metadata        JSONB DEFAULT '{}',            -- channel-specific extras
+  created_at      TIMESTAMPTZ DEFAULT now(),
+  updated_at      TIMESTAMPTZ DEFAULT now()
+);
+```
+
+### 3.2 Ticket Comments / Activity Log
+
+```sql
+CREATE TABLE ticket_comments (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ticket_id   UUID NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,
+  author_id   UUID NOT NULL REFERENCES users(id),
+  comment     TEXT NOT NULL,
+  is_internal BOOLEAN DEFAULT FALSE,  -- internal notes not visible to raiser
+  attachments JSONB DEFAULT '[]',     -- [{name, url, mime_type}]
+  created_at  TIMESTAMPTZ DEFAULT now()
+);
+```
+
+### 3.3 Ticket Escalation Log
+
+```sql
+CREATE TABLE ticket_escalations (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ticket_id       UUID NOT NULL REFERENCES tickets(id),
+  escalated_from  UUID REFERENCES users(id),
+  escalated_to    UUID REFERENCES users(id),
+  from_group      UUID REFERENCES assignment_groups(id),
+  to_group        UUID REFERENCES assignment_groups(id),
+  level           INTEGER NOT NULL,   -- 1, 2, 3
+  reason          TEXT,
+  auto_triggered  BOOLEAN DEFAULT FALSE,
+  created_at      TIMESTAMPTZ DEFAULT now()
+);
+```
+
+### 3.4 Master Data — Categories
+
+```sql
+CREATE TABLE ticket_categories (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id      UUID NOT NULL REFERENCES orgs(id),
+  name        TEXT NOT NULL,          -- 'Software', 'Hardware', 'Network', 'Operational'
+  code        TEXT NOT NULL,
+  icon        TEXT,                   -- icon name for UI
+  is_active   BOOLEAN DEFAULT TRUE,
+  sort_order  INTEGER DEFAULT 0,
+  created_at  TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE TABLE ticket_subcategories (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  category_id   UUID NOT NULL REFERENCES ticket_categories(id),
+  org_id        UUID NOT NULL REFERENCES orgs(id),
+  name          TEXT NOT NULL,        -- 'Vehicle Registration', 'RFID Reader', 'Weighbridge'
+  code          TEXT NOT NULL,
+  default_priority TEXT DEFAULT 'medium',
+  default_group UUID REFERENCES assignment_groups(id),  -- auto-assign group
+  sla_hours     NUMERIC(5,2),         -- override org-level SLA
+  is_active     BOOLEAN DEFAULT TRUE,
+  sort_order    INTEGER DEFAULT 0
+);
+```
+
+### 3.5 Master Data — Assignment Groups & Members
+
+```sql
+CREATE TABLE assignment_groups (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id      UUID NOT NULL REFERENCES orgs(id),
+  name        TEXT NOT NULL,          -- 'L1 Support', 'Network Team', 'Java Backend Team'
+  code        TEXT NOT NULL,
+  description TEXT,
+  is_active   BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE group_members (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  group_id    UUID NOT NULL REFERENCES assignment_groups(id),
+  user_id     UUID NOT NULL REFERENCES users(id),
+  role        TEXT DEFAULT 'member',  -- 'member' | 'lead'
+  is_active   BOOLEAN DEFAULT TRUE
+);
+```
+
+### 3.6 Master Data — Escalation Rules
+
+```sql
+CREATE TABLE escalation_rules (
+  id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id            UUID NOT NULL REFERENCES orgs(id),
+  name              TEXT NOT NULL,
+  category_id       UUID REFERENCES ticket_categories(id),    -- NULL = applies to all
+  subcategory_id    UUID REFERENCES ticket_subcategories(id), -- NULL = applies to all
+  priority          TEXT,                                      -- NULL = applies to all
+  level             INTEGER NOT NULL,         -- 1 = first escalation, 2 = second, etc.
+  trigger_after_min INTEGER NOT NULL,         -- minutes since assignment/last escalation
+  escalate_to_group UUID REFERENCES assignment_groups(id),
+  notify_emails     TEXT[],                   -- additional notification recipients
+  is_active         BOOLEAN DEFAULT TRUE,
+  created_at        TIMESTAMPTZ DEFAULT now()
+);
+```
+
+### 3.7 Shift & Roster Tables
+
+```sql
+CREATE TABLE shift_definitions (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id      UUID NOT NULL REFERENCES orgs(id),
+  name        TEXT NOT NULL,          -- 'Morning Shift', 'Night Shift'
+  code        TEXT NOT NULL,          -- 'A', 'B', 'C'
+  start_time  TIME NOT NULL,          -- e.g. 06:00
+  end_time    TIME NOT NULL,          -- e.g. 14:00
+  crosses_midnight BOOLEAN DEFAULT FALSE,
+  is_active   BOOLEAN DEFAULT TRUE
+);
+
+CREATE TABLE shift_rosters (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id          UUID NOT NULL REFERENCES orgs(id),
+  user_id         UUID NOT NULL REFERENCES users(id),
+  group_id        UUID NOT NULL REFERENCES assignment_groups(id),
+  shift_id        UUID NOT NULL REFERENCES shift_definitions(id),
+  roster_date     DATE NOT NULL,
+  level           TEXT DEFAULT 'agent',  -- 'agent' | 'lead' | 'supervisor'
+  is_active       BOOLEAN DEFAULT TRUE,
+  UNIQUE (user_id, roster_date, shift_id)
+);
+```
+
+### 3.8 RCA Tables
+
+```sql
+CREATE TABLE ticket_rca (
+  id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  ticket_id             UUID NOT NULL REFERENCES tickets(id) UNIQUE,
+  root_cause            TEXT NOT NULL,          -- internal technical description
+  contributing_factors  TEXT,
+  corrective_actions    TEXT,
+  preventive_actions    TEXT,
+  affected_systems      TEXT[],
+  -- Customer-facing version
+  customer_summary      TEXT NOT NULL,          -- plain-language explanation
+  customer_actions      TEXT,                   -- what customer needs to do, if any
+  -- Files
+  internal_doc_url      TEXT,                   -- Supabase Storage URL
+  customer_doc_url      TEXT,                   -- Supabase Storage URL
+  prepared_by           UUID REFERENCES users(id),
+  reviewed_by           UUID REFERENCES users(id),
+  submitted_at          TIMESTAMPTZ,
+  created_at            TIMESTAMPTZ DEFAULT now(),
+  updated_at            TIMESTAMPTZ DEFAULT now()
+);
+```
+
+### 3.9 SLA Configuration
+
+```sql
+CREATE TABLE sla_policies (
+  id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  org_id          UUID NOT NULL REFERENCES orgs(id),
+  name            TEXT NOT NULL,
+  priority        TEXT NOT NULL,     -- 'critical' | 'high' | 'medium' | 'low'
+  category_id     UUID REFERENCES ticket_categories(id),
+  response_min    INTEGER NOT NULL,  -- minutes to first response
+  resolution_hrs  NUMERIC(5,2) NOT NULL,  -- hours to resolution
+  is_active       BOOLEAN DEFAULT TRUE
+);
+```
+
+---
+
+## 4. Master Data & Configuration
+
+All resolution behavior is driven by master data, configurable by admins without code changes.
+
+### 4.1 Configuration Hierarchy
+
+```
+Org
+ ├── Locations (plants / sites)
+ ├── Ticket Categories
+ │    └── Ticket Subcategories
+ │         ├── Default Priority
+ │         ├── Default Assignment Group
+ │         └── SLA Override
+ ├── Assignment Groups
+ │    └── Group Members (with roles)
+ ├── Escalation Rules
+ │    ├── Triggered by time since assignment
+ │    └── Routes to specific group at each level
+ ├── SLA Policies (per priority × category)
+ ├── Shift Definitions
+ └── Shift Rosters (uploaded per week/month)
+```
+
+### 4.2 Sample Category Configuration
+
+```
+Category: Hardware
+  └── Subcategory: RFID Reader
+        Default Priority: High
+        Default Group: L1 Support
+        SLA Override: 4 hours
+  └── Subcategory: Boom Barrier
+        Default Priority: Critical
+        Default Group: L1 Support
+        SLA Override: 2 hours
+  └── Subcategory: Weighbridge
+        Default Priority: High
+        Default Group: L1 Support
+        SLA Override: 4 hours
+
+Category: Software
+  └── Subcategory: Vehicle Registration
+        Default Priority: Medium
+        Default Group: L1 Support
+  └── Subcategory: SAP Integration / EGP
+        Default Priority: High
+        Default Group: Java Backend Team
+  └── Subcategory: Trip Creation
+        Default Priority: Medium
+        Default Group: L1 Support
+
+Category: Network
+  └── Subcategory: Internet Connectivity
+        Default Priority: High
+        Default Group: Network Team
+  └── Subcategory: RFID Network
+        Default Priority: Critical
+        Default Group: Network Team
+
+Category: Operational
+  └── Subcategory: Gate Entry Rejected
+        Default Priority: High
+        Default Group: L1 Support
+  └── Subcategory: Data Sync Issue
+        Default Priority: High
+        Default Group: Data Team
+```
+
+### 4.3 Roster Upload Format (CSV)
+
+```csv
+user_email,group_code,shift_code,roster_date,level
+john@company.com,L1,A,2025-07-01,agent
+jane@company.com,L1,B,2025-07-01,lead
+ravi@company.com,NETWORK,A,2025-07-01,agent
+```
+
+Admins upload a weekly or monthly CSV. The system parses and populates `shift_rosters`.
+
+---
+
+## 5. Ticket Lifecycle & Resolution Flow
+
+### 5.1 States
+
+```
+open → in_progress → pending_raiser → in_progress → resolved → closed
+                  ↘ escalated → in_progress (new agent) → resolved → closed
+```
+
+| State | Description |
+|---|---|
+| `open` | Ticket raised, not yet picked up |
+| `in_progress` | Assigned to an agent/group, being worked |
+| `pending_raiser` | Awaiting response/action from the ticket raiser |
+| `escalated` | Transferred to higher level |
+| `resolved` | Solution applied; RCA submitted (if required) |
+| `closed` | Raiser confirmed or auto-closed after 48 hrs |
+
+### 5.2 Resolution Flow Detail
+
+```
+1. Ticket Raised (any channel)
+   ↓
+2. System reads category + subcategory from ticket
+   ↓
+3. Looks up default_group from subcategory master
+   ↓
+4. Queries shift_rosters: who is ON SHIFT NOW in that group?
+   ↓
+5. Assigns to on-duty agent(s) — adds to their worklist
+   ↓
+6. SLA timer starts
+   ↓
+7. Agent receives notification (push / email / in-app)
+   ↓
+8. Agent opens ticket → Acknowledges → Works on it
+   ↓
+9a. Resolved → Submit RCA → Close
+9b. Needs specialist → Manual reassign to another group/person
+9c. SLA breach approaching → Auto-escalation triggered by escalation_rules
+   ↓
+10. If escalated → New assignee gets notification → Picks up
+   ↓
+11. Resolution → Customer RCA entered → Ticket resolved
+   ↓
+12. Raiser notified → Confirms or auto-close in 48 hrs
+```
+
+### 5.3 Worklist Rules
+
+- Each on-shift agent sees only tickets assigned to them or their group.
+- Tickets are sorted by: Priority (Critical → High → Medium → Low), then by SLA due time ascending.
+- If no agent is on shift in the target group, ticket is assigned to the group queue and the group lead is notified.
+- Lead can manually assign from the group queue.
+
+---
+
+## 6. Shift Management & Roster Engine
+
+### 6.1 On-Duty Lookup Algorithm
+
+```javascript
+// Called whenever a ticket is created or reassigned
+async function getOnDutyAgents(groupId, orgId) {
+  const now = new Date();
+  const todayDate = now.toISOString().split('T')[0];
+  const currentTime = now.toTimeString().slice(0, 5); // HH:MM
+
+  // Find shifts active right now
+  const activeShifts = await supabase
+    .from('shift_definitions')
+    .select('*')
+    .eq('org_id', orgId)
+    .eq('is_active', true);
+
+  const matchingShifts = activeShifts.data.filter(shift => {
+    if (!shift.crosses_midnight) {
+      return currentTime >= shift.start_time && currentTime < shift.end_time;
+    } else {
+      return currentTime >= shift.start_time || currentTime < shift.end_time;
+    }
+  });
+
+  if (matchingShifts.length === 0) return [];
+
+  const shiftIds = matchingShifts.map(s => s.id);
+
+  // Find rostered agents in those shifts for this group today
+  const { data: roster } = await supabase
+    .from('shift_rosters')
+    .select('user_id, level, users(id, name, email)')
+    .eq('group_id', groupId)
+    .eq('org_id', orgId)
+    .eq('roster_date', todayDate)
+    .in('shift_id', shiftIds)
+    .eq('is_active', true);
+
+  return roster || [];
+}
+```
+
+### 6.2 Assignment Strategy
+
+| Condition | Action |
+|---|---|
+| Single on-duty agent in group | Assign directly |
+| Multiple on-duty agents | Round-robin based on open ticket count (least-loaded agent) |
+| No on-duty agents | Assign to group queue; notify group lead |
+| No roster uploaded | Assign to group queue; alert admin |
+
+### 6.3 Shift Handover
+
+At shift end (configurable, e.g., 5 min before shift ends):
+- Open tickets assigned to outgoing agents are flagged.
+- Incoming shift agents are notified of inherited open tickets.
+- Ticket `shift_id` is updated to the new shift for SLA tracking purposes.
+
+---
+
+## 7. Escalation Engine
+
+### 7.1 How Escalations Work
+
+A `node-cron` job runs every 5 minutes and evaluates all open/in-progress tickets against `escalation_rules`.
+
+```javascript
+cron.schedule('*/5 * * * *', async () => {
+  const now = new Date();
+
+  // Fetch all tickets with active SLA
+  const { data: tickets } = await supabase
+    .from('tickets')
+    .select('*, ticket_escalations(level, created_at)')
+    .in('status', ['open', 'in_progress'])
+    .eq('sla_breached', false);
+
+  for (const ticket of tickets) {
+    const currentLevel = ticket.ticket_escalations.length;
+    const lastEventTime = currentLevel > 0
+      ? new Date(ticket.ticket_escalations.at(-1).created_at)
+      : new Date(ticket.created_at);
+
+    const minutesSinceLastEvent = (now - lastEventTime) / 60000;
+
+    // Check escalation rules for this ticket's category/priority/level
+    const rules = await getApplicableEscalationRules(ticket, currentLevel + 1);
+
+    for (const rule of rules) {
+      if (minutesSinceLastEvent >= rule.trigger_after_min) {
+        await escalateTicket(ticket.id, rule);
+      }
+    }
+  }
+});
+```
+
+### 7.2 Escalation Rule Configuration Example
+
+```
+Category: Hardware
+Subcategory: RFID Reader
+Priority: Critical
+
+  Level 1 → Trigger after 30 min → Escalate to: L2 Network Team
+  Level 2 → Trigger after 60 min → Escalate to: L3 Senior Engineer
+  Level 2 → Also notify: [ops-head@company.com, plant-manager@company.com]
+```
+
+All of this is configurable in the admin panel — no code changes needed.
+
+---
+
+## 8. Intake Channels
+
+### 8.1 Web Portal / Mobile App (Direct Form)
+
+- Dedicated "Raise a Ticket" screen with structured form.
+- Category and subcategory dropdowns (populated from master data).
+- Location picker (plant / site).
+- Priority suggestion (shown based on subcategory default, user can override).
+- File attachment (screenshots, videos).
+- Optional chatbot-assisted flow (see Section 9).
+
+### 8.2 Email Integration
+
+- A dedicated support email is configured per org (e.g., `support-itms@company.com`).
+- Inbound email is parsed via Mailgun Inbound Routes or similar webhook.
+- Subject → ticket title. Body → description. Sender email → mapped to ITMS user.
+- If sender is not a registered user, ticket is created with `source: email` and `raised_by: null`; admin is notified.
+- Attachments are stored in Supabase Storage.
+
+```javascript
+// Express route for email webhook
+app.post('/webhooks/email', async (req, res) => {
+  const { sender, subject, body_plain, attachments } = req.body;
+  const user = await getUserByEmail(sender);
+  await createTicket({
+    title: subject,
+    description: body_plain,
+    source: 'email',
+    raised_by: user?.id || null,
+    // category/subcategory = null initially; L1 will triage
+  });
+  res.sendStatus(200);
+});
+```
+
+### 8.3 WhatsApp Integration (Twilio)
+
+- Transporter sends WhatsApp message to ITMS support number.
+- Twilio webhook fires → Express receives message.
+- If first message from user: initiate chatbot flow (see Section 9).
+- Session state stored in Redis or Supabase `chat_sessions` table.
+- Once chatbot collects all details, ticket is auto-created and WhatsApp confirmation sent.
+
+### 8.4 Telegram Integration
+
+- A Telegram Bot is registered and assigned to the ITMS org.
+- `/start` → initiates chatbot flow.
+- Same chatbot state machine as WhatsApp.
+- `node-telegram-bot-api` handles message receipt.
+
+### 8.5 Channel Summary Table
+
+| Channel | Library / Service | Auth Method | Session Storage |
+|---|---|---|---|
+| Web Portal | React in-app | ITMS JWT | N/A |
+| Mobile App | React Native in-app | ITMS JWT | N/A |
+| Email | Mailgun Webhooks | Email → User lookup | N/A |
+| WhatsApp | Twilio WhatsApp API | Phone → User lookup | Supabase `chat_sessions` |
+| Telegram | Telegram Bot API | Telegram ID → User lookup | Supabase `chat_sessions` |
+
+---
+
+## 9. Chatbot Flow
+
+The chatbot is a deterministic state machine — not AI-dependent (though an AI layer can be added later). It guides the user step by step to collect all required ticket fields.
+
+### 9.1 Chatbot State Machine
+
+```
+State: START
+  Bot: "Hi! I'll help you raise a support ticket. What is the issue about?"
+  [Category buttons shown]
+  User selects → State: CATEGORY_SELECTED
+
+State: CATEGORY_SELECTED
+  Bot: "Got it. Can you tell me more specifically what the problem is?"
+  [Subcategory buttons shown]
+  User selects → State: SUBCATEGORY_SELECTED
+
+State: SUBCATEGORY_SELECTED
+  Bot: "Where is this issue occurring?"
+  Options: [Plant] [Site] [Remote / Not applicable]
+  User selects → State: LOCATION_SELECTED
+
+State: LOCATION_SELECTED
+  Bot: "How severe is this issue?"
+  Options: [Critical – operations stopped] [High – major impact] [Medium] [Low – minor]
+  User selects → State: PRIORITY_SELECTED
+
+State: PRIORITY_SELECTED
+  Bot: "Please briefly describe the issue in one or two sentences."
+  User types → State: DESCRIPTION_CAPTURED
+
+State: DESCRIPTION_CAPTURED
+  Bot: "Would you like to attach a photo or file? (Reply 'skip' to skip)"
+  User sends file or skips → State: ATTACHMENT_DONE
+
+State: ATTACHMENT_DONE
+  Bot: Summarizes all collected info:
+       "Here's your ticket summary:
+        Category: Hardware > RFID Reader
+        Location: Plant – Pune
+        Priority: Critical
+        Issue: The RFID reader at Gate 3 is not reading FASTag.
+        
+        Shall I submit this? [Yes, Submit] [Edit]"
+  User confirms → Ticket created → State: COMPLETED
+
+State: COMPLETED
+  Bot: "Your ticket TKT-2025-00043 has been raised. You'll receive updates here."
+```
+
+### 9.2 Chat Session Table
+
+```sql
+CREATE TABLE chat_sessions (
+  id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  channel     TEXT NOT NULL,         -- 'whatsapp' | 'telegram' | 'web_chatbot'
+  channel_id  TEXT NOT NULL,         -- Telegram chat_id / WhatsApp number
+  user_id     UUID REFERENCES users(id),
+  state       TEXT NOT NULL DEFAULT 'START',
+  context     JSONB DEFAULT '{}',    -- collected fields so far
+  last_active TIMESTAMPTZ DEFAULT now(),
+  created_at  TIMESTAMPTZ DEFAULT now()
+);
+```
+
+### 9.3 Web / Mobile Chatbot
+
+The same state machine is rendered as an embedded chat widget in the ITMS portal and mobile app. Buttons are rendered as tappable chips. The experience mirrors the WhatsApp/Telegram bot but within the native UI.
+
+---
+
+## 10. RCA Module
+
+### 10.1 Overview
+
+When a ticket is resolved, the resolving agent is required (configurable — can be optional for low-priority tickets) to submit an RCA. There are two distinct RCA records:
+
+1. **Technical RCA** — Internal, detailed root cause, for engineering and ops teams.
+2. **Customer RCA** — Plain-language summary, shared with the ticket raiser.
+
+### 10.2 RCA Submission Flow
+
+```
+Agent clicks "Resolve Ticket"
+  ↓
+RCA form appears (cannot close ticket without submission if RCA required)
+  ↓
+Agent fills:
+  - Root Cause (technical)
+  - Contributing Factors
+  - Corrective Action (what was done to fix)
+  - Preventive Action (how to stop recurrence)
+  - Affected Systems (multi-select)
+  - Customer Summary (plain language; what the customer needs to know)
+  - Customer Next Steps (if any)
+  ↓
+Optional: Upload internal RCA doc (PDF, DOCX)
+Optional: Upload customer-facing RCA doc
+  ↓
+Submit → ticket status → 'resolved'
+  ↓
+Customer receives notification with Customer Summary
+Internal team can access full Technical RCA
+```
+
+### 10.3 RCA Visibility Rules
+
+| RCA Field | Ticket Raiser | L1/L2 Agent | Admin/Supervisor |
+|---|---|---|---|
+| Customer Summary | ✅ Visible | ✅ Visible | ✅ Visible |
+| Customer Doc | ✅ Downloadable | ✅ Downloadable | ✅ Downloadable |
+| Root Cause (technical) | ❌ Hidden | ✅ Visible | ✅ Visible |
+| Contributing Factors | ❌ Hidden | ✅ Visible | ✅ Visible |
+| Corrective Actions | ❌ Hidden | ✅ Visible | ✅ Visible |
+| Internal RCA Doc | ❌ Hidden | ✅ Downloadable | ✅ Downloadable |
+
+### 10.4 RCA Required Flag
+
+In `ticket_subcategories`, a field `rca_required BOOLEAN DEFAULT TRUE` controls whether RCA submission is mandatory. Admins can configure this per subcategory. E.g., low-priority cosmetic bugs may not need RCA, but all hardware failures and SAP integration issues do.
+
+---
+
+## 11. API Design
+
+All endpoints are prefixed with `/api/v1`. Authentication uses JWT (issued by Supabase Auth or ITMS Auth, passed as `Authorization: Bearer <token>`).
+
+### 11.1 Tickets
+
+```
+POST   /api/v1/tickets                  Create ticket
+GET    /api/v1/tickets                  List tickets (with filters: status, category, assignee, date range)
+GET    /api/v1/tickets/:id              Get ticket detail
+PATCH  /api/v1/tickets/:id              Update ticket (status, priority, assignment)
+POST   /api/v1/tickets/:id/comments     Add comment
+GET    /api/v1/tickets/:id/comments     Get comments
+POST   /api/v1/tickets/:id/assign       Assign to user or group
+POST   /api/v1/tickets/:id/escalate     Manual escalation
+POST   /api/v1/tickets/:id/resolve      Resolve (triggers RCA flow)
+POST   /api/v1/tickets/:id/close        Close ticket
+GET    /api/v1/tickets/:id/history      Full audit trail
+```
+
+### 11.2 RCA
+
+```
+POST   /api/v1/tickets/:id/rca          Submit RCA
+GET    /api/v1/tickets/:id/rca          Get RCA (role-filtered response)
+PATCH  /api/v1/tickets/:id/rca          Update RCA
+POST   /api/v1/tickets/:id/rca/upload   Upload RCA document (internal or customer)
+```
+
+### 11.3 Master Data (Admin)
+
+```
+GET/POST/PATCH/DELETE  /api/v1/admin/categories
+GET/POST/PATCH/DELETE  /api/v1/admin/subcategories
+GET/POST/PATCH/DELETE  /api/v1/admin/groups
+GET/POST/PATCH/DELETE  /api/v1/admin/escalation-rules
+GET/POST/PATCH/DELETE  /api/v1/admin/sla-policies
+GET/POST/PATCH/DELETE  /api/v1/admin/shift-definitions
+GET/POST               /api/v1/admin/rosters            Roster upload (CSV)
+GET                    /api/v1/admin/rosters/on-duty     Current on-duty agents per group
+```
+
+### 11.4 Webhooks (Intake)
+
+```
+POST  /webhooks/email       Inbound email (Mailgun / Postmark)
+POST  /webhooks/whatsapp    Twilio WhatsApp
+POST  /webhooks/telegram    Telegram Bot
+```
+
+### 11.5 Reports
+
+```
+GET  /api/v1/reports/summary             Ticket summary (open/closed/SLA breach counts)
+GET  /api/v1/reports/by-category         Breakdown by category
+GET  /api/v1/reports/sla                 SLA compliance report
+GET  /api/v1/reports/agent-performance   Tickets per agent, avg resolution time
+GET  /api/v1/reports/escalation          Escalation trends
+```
+
+---
+
+## 12. Frontend — Web Portal
+
+### 12.1 Pages & Modules
+
+```
+/                    → Dashboard (open tickets, SLA status, recent activity)
+/tickets             → My Tickets (for transporters/users)
+/tickets/new         → Raise a Ticket (form + chatbot toggle)
+/tickets/:id         → Ticket Detail View
+/worklist            → Agent Worklist (for L1/L2 agents)
+/admin               → Admin Panel
+  /admin/categories  → Category & Subcategory Management
+  /admin/groups      → Assignment Group Management
+  /admin/escalation  → Escalation Rule Configuration
+  /admin/sla         → SLA Policy Configuration
+  /admin/shifts      → Shift Definition & Roster Upload
+  /admin/users       → User Management
+/reports             → Reports & Analytics
+```
+
+### 12.2 Ticket Detail Page Components
+
+- **Header:** Ticket number, title, status badge, priority badge, SLA countdown timer.
+- **Info Panel:** Category, subcategory, location, source, raised by, created at.
+- **Assignment Panel:** Current assignee, group, shift. Reassign button (for leads/admins).
+- **Activity Timeline:** All comments, status changes, assignments, escalations — in chronological order. Internal notes shown only to agents/admins.
+- **RCA Section:** Visible when ticket is resolved. Role-filtered display.
+- **Action Bar:** Context-sensitive buttons — Acknowledge, Assign, Escalate, Resolve, Close.
+
+### 12.3 Agent Worklist
+
+- Real-time updates via Supabase Realtime subscriptions.
+- Tickets sorted by: priority → SLA due.
+- Color-coded SLA status: green (>50% time), amber (25–50%), red (<25%), grey (breached).
+- Quick-action chips on each row: Acknowledge | Comment | Reassign | Resolve.
+
+### 12.4 Admin — Roster Upload UI
+
+- Drag-and-drop CSV upload.
+- Preview table before commit.
+- Validation errors shown inline (e.g., "User not found: ravi@company.com").
+- Calendar view showing on-duty coverage per group per day.
+
+---
+
+## 13. Frontend — Mobile App
+
+### 13.1 Tech: React Native (Expo)
+
+The mobile app shares business logic and API clients with the web app. UI components are platform-native (React Native Paper or NativeBase).
+
+### 13.2 Key Screens
+
+- **Home:** My open tickets + quick "Raise Ticket" button.
+- **Raise Ticket:** Chatbot-style step-by-step form (matches chatbot flow in Section 9). Camera integration for photo attachments.
+- **My Tickets:** List with status badges and SLA indicators.
+- **Ticket Detail:** Same information as web, optimized for mobile.
+- **Notifications:** In-app notification center.
+- **Worklist (for agents):** Swipe-to-acknowledge, priority-sorted list.
+
+### 13.3 Offline Capability
+
+- Ticket drafts are saved locally if offline.
+- Submitted automatically when connectivity is restored.
+- Read-only access to recently viewed tickets available offline.
+
+---
+
+## 14. Notifications & Alerts
+
+### 14.1 Notification Events
+
+| Event | Notified Party | Channel |
+|---|---|---|
+| Ticket raised | L1 on-shift agents | Push, Email, In-app |
+| Ticket assigned | Assigned agent | Push, Email, In-app |
+| New comment | Assignee + Raiser | Push, In-app |
+| SLA 75% consumed | Assigned agent, Group Lead | Email, In-app |
+| SLA breached | Agent, Lead, Admin | Email, Push |
+| Auto-escalation triggered | New assignee, Previous assignee | Push, Email |
+| Manual escalation | New assignee | Push, Email |
+| Ticket resolved | Ticket raiser | Push, Email, WhatsApp/TG (if raised via those channels) |
+| RCA submitted | Ticket raiser (customer RCA only) | Email |
+| No agent on shift (gap alert) | Admin, Group Lead | Email |
+
+### 14.2 Notification Service Architecture
+
+```javascript
+// notification.service.js
+async function notify(event, ticketId, recipientIds) {
+  const preferences = await getUserNotificationPreferences(recipientIds);
+  for (const pref of preferences) {
+    if (pref.push_enabled) await sendPush(pref.fcm_token, event, ticketId);
+    if (pref.email_enabled) await sendEmail(pref.email, event, ticketId);
+    await createInAppNotification(pref.user_id, event, ticketId);
+  }
+}
+```
+
+---
+
+## 15. Roles & Permissions
+
+### 15.1 Role Definitions
+
+| Role | Key Permissions |
+|---|---|
+| `ticket_raiser` | Create tickets, view own tickets, add comments on own tickets |
+| `l1_agent` | All of above + view group worklist, assign within group, resolve tickets, submit RCA |
+| `l2_agent` | All of above + receive escalations, reassign across groups |
+| `l3_senior` | All of above + override any assignment, view all tickets |
+| `group_lead` | Manage group queue, reassign within group, view group reports |
+| `admin` | Full access including master data, roster management, config |
+| `report_viewer` | Read-only access to reports |
+
+### 15.2 Supabase RLS
+
+All tables have row-level security enabled. Sample policy for `tickets`:
+
+```sql
+-- Raisers see only their own tickets
+CREATE POLICY "raiser_view_own" ON tickets
+  FOR SELECT USING (raised_by = auth.uid());
+
+-- Agents see tickets assigned to them or their group
+CREATE POLICY "agent_view_assigned" ON tickets
+  FOR SELECT USING (
+    assigned_to = auth.uid() OR
+    assigned_group IN (
+      SELECT group_id FROM group_members WHERE user_id = auth.uid()
+    )
+  );
+
+-- Admins see all tickets in their org
+CREATE POLICY "admin_view_all" ON tickets
+  FOR SELECT USING (
+    org_id IN (
+      SELECT org_id FROM user_org_roles
+      WHERE user_id = auth.uid() AND role = 'admin'
+    )
+  );
+```
+
+---
+
+## 16. Reporting & Analytics
+
+### 16.1 Standard Reports
+
+- **Ticket Volume:** Total tickets by period, by category, by location.
+- **SLA Compliance:** % of tickets resolved within SLA, breakdown by category/priority.
+- **Agent Performance:** Tickets handled per agent, average first response time, average resolution time.
+- **Escalation Report:** Escalation rate by category, by agent, trend over time.
+- **Open Ticket Aging:** All open tickets with age > configurable threshold (e.g., > 24 hrs).
+- **RCA Summary:** Count of RCAs submitted, pending, and recurring root causes.
+
+### 16.2 Dashboard KPI Cards
+
+- Open tickets right now
+- SLA breach count (last 24 hrs)
+- Average resolution time (this week)
+- Tickets raised today vs yesterday
+- On-shift coverage (groups with/without active agents)
+
+---
+
+## 17. Integration Points (ITMS Core)
+
+### 17.1 Contextual Ticket Linking
+
+ITMS core (Angular + Spring) passes contextual identifiers when triggering the ticket widget:
+
+```json
+{
+  "context_type": "vehicle_registration",
+  "context_id": "VEH-00123",
+  "plant_id": "PLANT-PUNE-01",
+  "user_id": "USER-456"
+}
+```
+
+These are stored in `tickets.metadata` and shown in the ticket detail for agent reference.
+
+### 17.2 Embeddable Widget
+
+A JavaScript widget (`itms-support-widget.js`) is embeddable in the Angular ITMS portal:
+
+```html
+<!-- In Angular component -->
+<itms-support-widget 
+  [context]="{ type: 'trip', id: tripId }"
+  [user]="currentUser"
+  [plantId]="currentPlantId">
+</itms-support-widget>
+```
+
+The widget opens the chatbot flow with context pre-populated.
+
+### 17.3 REST API Auth Bridge
+
+ITMS Core authenticates users via its own JWT. The ticketing system accepts ITMS JWTs via a trust bridge: the Express middleware validates the ITMS JWT signature and maps the user to the ticketing system's user record.
+
+---
+
+## 18. Implementation Roadmap
+
+### Phase 1 — Core (Weeks 1–6)
+
+- [ ] Database schema setup in Supabase
+- [ ] Express API: ticket CRUD, comments, status transitions
+- [ ] Master data API: categories, subcategories, groups, SLA
+- [ ] Basic React web portal: raise ticket, my tickets, ticket detail
+- [ ] JWT auth integration with ITMS
+- [ ] Email intake (Mailgun webhook)
+- [ ] Push notifications (FCM)
+- [ ] Shift definitions and roster upload
+
+### Phase 2 — Routing & Automation (Weeks 7–10)
+
+- [ ] Shift-aware assignment engine
+- [ ] Escalation rule engine (cron job)
+- [ ] SLA tracking and breach alerts
+- [ ] Agent worklist with real-time updates (Supabase Realtime)
+- [ ] Admin configuration panel (all master data)
+- [ ] RCA module
+
+### Phase 3 — Multi-Channel & Mobile (Weeks 11–15)
+
+- [ ] Chatbot state machine (web + mobile)
+- [ ] WhatsApp bot (Twilio)
+- [ ] Telegram bot
+- [ ] React Native mobile app
+- [ ] Offline draft support
+
+### Phase 4 — Reporting & Polish (Weeks 16–18)
+
+- [ ] Reports & analytics dashboard
+- [ ] ITMS Angular widget embedding
+- [ ] Performance testing & optimization
+- [ ] UAT and go-live
+
+---
+
+## 19. Environment & DevOps
+
+### 19.1 Environment Variables (Express)
+
+```env
+SUPABASE_URL=https://xxxx.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+SUPABASE_ANON_KEY=your_anon_key
+ITMS_JWT_SECRET=your_itms_jwt_secret
+MAILGUN_API_KEY=your_mailgun_key
+MAILGUN_DOMAIN=mg.yourcompany.com
+TWILIO_ACCOUNT_SID=your_twilio_sid
+TWILIO_AUTH_TOKEN=your_twilio_auth
+TWILIO_WHATSAPP_NUMBER=whatsapp:+14155238886
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token
+FCM_SERVER_KEY=your_fcm_key
+PORT=3000
+NODE_ENV=production
+```
+
+### 19.2 Folder Structure
+
+```
+itms-ticketing/
+├── backend/
+│   ├── src/
+│   │   ├── routes/          # Express routers
+│   │   ├── services/        # Business logic (ticket, shift, escalation, notification)
+│   │   ├── middlewares/     # Auth, error handling
+│   │   ├── jobs/            # Cron jobs (SLA checker, escalation engine)
+│   │   ├── webhooks/        # Email, WhatsApp, Telegram handlers
+│   │   └── utils/
+│   ├── supabase/
+│   │   └── migrations/      # SQL migration files
+│   └── package.json
+├── frontend-web/
+│   ├── src/
+│   │   ├── pages/
+│   │   ├── components/
+│   │   ├── hooks/
+│   │   ├── services/        # API client
+│   │   └── store/           # State management (Zustand or Redux Toolkit)
+│   └── package.json
+└── frontend-mobile/
+    ├── src/
+    │   ├── screens/
+    │   ├── components/
+    │   └── services/
+    └── package.json
+```
+
+### 19.3 Deployment
+
+| Service | Recommended Platform |
+|---|---|
+| Express Backend | Railway / Render / AWS ECS |
+| React Web | Vercel / Netlify |
+| React Native | App Store + Play Store (via Expo EAS) |
+| Database | Supabase (managed) |
+| File Storage | Supabase Storage |
+| Cron Jobs | Railway cron / AWS EventBridge |
+
+---
+
+*End of ITMS Ticketing System Solution Document*  
+*Document prepared for: Engineering & Product Team*  
+*Classification: Internal*
