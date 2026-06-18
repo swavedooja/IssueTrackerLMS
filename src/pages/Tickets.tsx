@@ -610,9 +610,9 @@ export const Tickets: React.FC<TicketsProps> = ({ currentUserId, onNavigate, sub
                         marginTop: '10px',
                         justifyContent: 'flex-start'
                       }}>
-                        {msg.options.map(opt => (
+                        {msg.options.map((opt, idx) => (
                           <button
-                            key={opt.value}
+                            key={opt.value + '-' + idx}
                             className="btn btn-secondary"
                             style={{ 
                               padding: '6px 12px', 
